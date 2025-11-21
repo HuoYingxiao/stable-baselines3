@@ -71,6 +71,7 @@ class PPO(OnPolicyAlgorithm):
     :param separate_optimizers: If True, use two optimizers to update actor and critic separately
         (hyperparameters identical). Shared feature extractor (if any) is updated once using
         the combined gradients from both losses.
+    :param log_param_norms: When True, log parameter norms (Frobenius, spectral, nuclear) and rank each update
     :param _init_setup_model: Whether or not to build the network at the creation of the instance
     """
 
@@ -110,6 +111,7 @@ class PPO(OnPolicyAlgorithm):
         advantage_multiplier: float = 1.0,
         normalize_advantage_mean: bool = True,
         separate_optimizers: bool = False,
+        log_param_norms: bool = False,
         _init_setup_model: bool = True,
     ):
         super().__init__(
@@ -175,6 +177,7 @@ class PPO(OnPolicyAlgorithm):
         self.normalize_advantage = normalize_advantage
         self.target_kl = target_kl
         self.separate_optimizers = separate_optimizers
+        self.log_param_norms = log_param_norms
 
         # Split-optimizer related attributes
         self.actor_optimizer: Optional[th.optim.Optimizer] = None
@@ -416,6 +419,8 @@ class PPO(OnPolicyAlgorithm):
         self.logger.record("train/clip_range", clip_range)
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
+        if self.log_param_norms:
+            self._record_param_norms()
 
     def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
         """
@@ -443,3 +448,43 @@ class PPO(OnPolicyAlgorithm):
             reset_num_timesteps=reset_num_timesteps,
             progress_bar=progress_bar,
         )
+
+    @th.no_grad()
+    def _record_param_norms(self) -> None:
+        params = [p.detach() for p in self.policy.parameters() if p.requires_grad]
+        if len(params) == 0:
+            return
+
+        float_params = [p.float() for p in params]
+        frobenius_sq = sum(p.pow(2).sum() for p in float_params)
+        frobenius_norm = th.sqrt(frobenius_sq).item()
+
+        spectral_norms: list[float] = []
+        nuclear_norms: list[float] = []
+        ranks: list[float] = []
+
+        for p in float_params:
+            if p.ndim <= 1:
+                mat = p.view(1, -1)
+            else:
+                mat = p.view(p.shape[0], -1)
+            spectral_norms.append(th.linalg.matrix_norm(mat, 2).item())
+            nuclear_norms.append(th.linalg.matrix_norm(mat, "nuc").item())
+            ranks.append(float(th.linalg.matrix_rank(mat).item()))
+
+        spectral_mean = float(sum(spectral_norms) / len(spectral_norms))
+        spectral_max = float(max(spectral_norms))
+        nuclear_mean = float(sum(nuclear_norms) / len(nuclear_norms))
+        nuclear_max = float(max(nuclear_norms))
+        rank_mean = float(sum(ranks) / len(ranks))
+        rank_max = float(max(ranks))
+        rank_sum = float(sum(ranks))
+
+        self.logger.record("train/param_norms/frobenius", frobenius_norm)
+        self.logger.record("train/param_norms/spectral_mean", spectral_mean)
+        self.logger.record("train/param_norms/spectral_max", spectral_max)
+        self.logger.record("train/param_norms/nuclear_mean", nuclear_mean)
+        self.logger.record("train/param_norms/nuclear_max", nuclear_max)
+        self.logger.record("train/param_norms/rank_mean", rank_mean)
+        self.logger.record("train/param_norms/rank_max", rank_max)
+        self.logger.record("train/param_norms/rank_sum", rank_sum)
