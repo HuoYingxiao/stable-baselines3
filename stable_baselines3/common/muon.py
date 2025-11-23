@@ -289,8 +289,8 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
 def make_muon_with_aux_adam(
     params,
     lr: float = 3e-4,
-    muon_lr: float | None = None,
-    adam_lr: float | None = None,
+    muon_lr = None,
+    adam_lr = None,
     muon_weight_decay: float = 0.0,
     adam_weight_decay: float = 0.0,
     adam_betas=(0.9, 0.95),
