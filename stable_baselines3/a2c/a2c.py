@@ -509,9 +509,9 @@ class A2C(OnPolicyAlgorithm):
 
             raise ValueError(f"statistic '{self.statistic}' not implemented for discrete SB3 policy.")
 
-        def _t_mean(self, states, actions):
-            t = self._statistic_components(states, actions)
-            return t.mean(dim=0)
+    def _t_mean(self, states, actions):
+        t = self._statistic_components(states, actions)
+        return t.mean(dim=0)
 
     @th.no_grad()
     def _compute_C_t_full(self, states, actions, ridge: Optional[float] = None):
