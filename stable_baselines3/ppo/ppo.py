@@ -10,7 +10,7 @@ from stable_baselines3.common.buffers import RolloutBuffer
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.policies import ActorCriticCnnPolicy, ActorCriticPolicy, BasePolicy, MultiInputActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.utils import FloatSchedule, explained_variance
+from stable_baselines3.common.utils import FloatSchedule, explained_variance, update_learning_rate
 
 SelfPPO = TypeVar("SelfPPO", bound="PPO")
 
@@ -71,6 +71,10 @@ class PPO(OnPolicyAlgorithm):
     :param separate_optimizers: If True, use two optimizers to update actor and critic separately
         (hyperparameters identical). Shared feature extractor (if any) is updated once using
         the combined gradients from both losses.
+    :param actor_learning_rate: Optional custom learning rate (or schedule) for the actor optimizer
+        when ``separate_optimizers`` is True.
+    :param critic_learning_rate: Optional custom learning rate (or schedule) for the critic optimizer
+        when ``separate_optimizers`` is True.
     :param log_param_norms: When True, log parameter norms (Frobenius, spectral, nuclear) and rank each update
     :param _init_setup_model: Whether or not to build the network at the creation of the instance
     """
@@ -111,6 +115,8 @@ class PPO(OnPolicyAlgorithm):
         advantage_multiplier: float = 1.0,
         normalize_advantage_mean: bool = True,
         separate_optimizers: bool = False,
+        actor_learning_rate: Union[float, Schedule, None] = None,
+        critic_learning_rate: Union[float, Schedule, None] = None,
         log_param_norms: bool = False,
         _init_setup_model: bool = True,
     ):
@@ -177,6 +183,8 @@ class PPO(OnPolicyAlgorithm):
         self.normalize_advantage = normalize_advantage
         self.target_kl = target_kl
         self.separate_optimizers = separate_optimizers
+        self.actor_learning_rate = actor_learning_rate
+        self.critic_learning_rate = critic_learning_rate
         self.log_param_norms = log_param_norms
 
         # Split-optimizer related attributes
@@ -184,6 +192,8 @@ class PPO(OnPolicyAlgorithm):
         self.critic_optimizer: Optional[th.optim.Optimizer] = None
         self._actor_params: Optional[list[th.nn.Parameter]] = None
         self._critic_params: Optional[list[th.nn.Parameter]] = None
+        self.actor_lr_schedule: Optional[Schedule] = None
+        self.critic_lr_schedule: Optional[Schedule] = None
 
         if _init_setup_model:
             self._setup_model()
@@ -201,6 +211,12 @@ class PPO(OnPolicyAlgorithm):
 
         # When requested, build two optimizers with separated parameter groups
         if self.separate_optimizers:
+            # Custom learning rates (if provided)
+            if self.actor_learning_rate is not None:
+                self.actor_lr_schedule = FloatSchedule(self.actor_learning_rate)
+            if self.critic_learning_rate is not None:
+                self.critic_lr_schedule = FloatSchedule(self.critic_learning_rate)
+
             # Helpers to collect unique parameters
             def _extend_unique(dst: list[th.nn.Parameter], params_iter) -> None:
                 seen = {id(p) for p in dst}
@@ -234,9 +250,14 @@ class PPO(OnPolicyAlgorithm):
             self._critic_params = critic_params
 
             # Create optimizers mirroring policy optimizer hyperparameters
-            initial_lr = self.lr_schedule(1)
-            self.actor_optimizer = self.policy.optimizer_class(self._actor_params, lr=initial_lr, **self.policy.optimizer_kwargs)  # type: ignore[arg-type]
-            self.critic_optimizer = self.policy.optimizer_class(self._critic_params, lr=initial_lr, **self.policy.optimizer_kwargs)  # type: ignore[arg-type]
+            actor_initial_lr = (
+                self.actor_lr_schedule(1) if self.actor_lr_schedule is not None else self.lr_schedule(1)
+            )
+            critic_initial_lr = (
+                self.critic_lr_schedule(1) if self.critic_lr_schedule is not None else self.lr_schedule(1)
+            )
+            self.actor_optimizer = self.policy.optimizer_class(self._actor_params, lr=actor_initial_lr, **self.policy.optimizer_kwargs)  # type: ignore[arg-type]
+            self.critic_optimizer = self.policy.optimizer_class(self._critic_params, lr=critic_initial_lr, **self.policy.optimizer_kwargs)  # type: ignore[arg-type]
 
     def train(self) -> None:
         """
@@ -247,7 +268,21 @@ class PPO(OnPolicyAlgorithm):
         # Update optimizer learning rate
         if self.separate_optimizers:
             assert self.actor_optimizer is not None and self.critic_optimizer is not None
-            self._update_learning_rate([self.actor_optimizer, self.critic_optimizer])
+            actor_lr = (
+                self.actor_lr_schedule(self._current_progress_remaining)  # type: ignore[operator]
+                if self.actor_lr_schedule is not None
+                else self.lr_schedule(self._current_progress_remaining)
+            )
+            critic_lr = (
+                self.critic_lr_schedule(self._current_progress_remaining)  # type: ignore[operator]
+                if self.critic_lr_schedule is not None
+                else self.lr_schedule(self._current_progress_remaining)
+            )
+            self.logger.record("train/learning_rate", actor_lr)
+            self.logger.record("train/learning_rate_actor", actor_lr)
+            self.logger.record("train/learning_rate_critic", critic_lr)
+            update_learning_rate(self.actor_optimizer, actor_lr)
+            update_learning_rate(self.critic_optimizer, critic_lr)
         else:
             self._update_learning_rate(self.policy.optimizer)
         # Compute current clip range
