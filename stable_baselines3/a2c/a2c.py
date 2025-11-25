@@ -6,7 +6,12 @@ from torch.nn import functional as F
 
 from stable_baselines3.common.buffers import RolloutBuffer
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
-from stable_baselines3.common.policies import ActorCriticCnnPolicy, ActorCriticPolicy, BasePolicy, MultiInputActorCriticPolicy
+from stable_baselines3.common.policies import (
+    ActorCriticCnnPolicy,
+    ActorCriticPolicy,
+    BasePolicy,
+    MultiInputActorCriticPolicy,
+)
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import FloatSchedule, explained_variance, update_learning_rate
 
@@ -16,61 +21,6 @@ SelfA2C = TypeVar("SelfA2C", bound="A2C")
 class A2C(OnPolicyAlgorithm):
     """
     Advantage Actor Critic (A2C)
-
-    Paper: https://arxiv.org/abs/1602.01783
-    Code: This implementation borrows code from https://github.com/ikostrikov/pytorch-a2c-ppo-acktr-gail and
-    and Stable Baselines (https://github.com/hill-a/stable-baselines)
-
-    Introduction to A2C: https://hackernoon.com/intuitive-rl-intro-to-advantage-actor-critic-a2c-4ff545978752
-
-    :param policy: The policy model to use (MlpPolicy, CnnPolicy, ...)
-    :param env: The environment to learn from (if registered in Gym, can be str)
-    :param learning_rate: The learning rate, it can be a function
-        of the current progress remaining (from 1 to 0)
-    :param n_steps: The number of steps to run for each environment per update
-        (i.e. batch size is n_steps * n_env where n_env is number of environment copies running in parallel)
-    :param gamma: Discount factor
-    :param gae_lambda: Factor for trade-off of bias vs variance for Generalized Advantage Estimator.
-        Equivalent to classic advantage when set to 1.
-    :param ent_coef: Entropy coefficient for the loss calculation
-    :param vf_coef: Value function coefficient for the loss calculation
-    :param max_grad_norm: The maximum value for the gradient clipping
-    :param rms_prop_eps: RMSProp epsilon. It stabilizes square root computation in denominator
-        of RMSProp update
-    :param use_rms_prop: Whether to use RMSprop (default) or Adam as optimizer
-    :param use_sde: Whether to use generalized State Dependent Exploration (gSDE)
-        instead of action noise exploration (default: False)
-    :param sde_sample_freq: Sample a new noise matrix every n steps when using gSDE
-        Default: -1 (only sample at the beginning of the rollout)
-    :param rollout_buffer_class: Rollout buffer class to use. If ``None``, it will be automatically selected.
-    :param rollout_buffer_kwargs: Keyword arguments to pass to the rollout buffer on creation.
-    :param normalize_advantage: Whether to normalize or not the advantage
-    :param stats_window_size: Window size for the rollout logging, specifying the number of episodes to average
-        the reported success rate, mean episode length, and mean reward over
-    :param tensorboard_log: the log location for tensorboard (if None, no logging)
-    :param policy_kwargs: additional arguments to be passed to the policy on creation. See :ref:`a2c_policies`
-    :param verbose: Verbosity level: 0 for no output, 1 for info messages (such as device or wrappers used), 2 for
-        debug messages
-    :param seed: Seed for the pseudo random generators
-    :param device: Device (cpu, cuda, ...) on which the code should be run.
-        Setting it to auto, the code will be run on the GPU if possible.
-    :param _init_setup_model: Whether or not to build the network at the creation of the instance
-    :param use_pullback: Whether to perform the pullback/anpg-style update instead of the vanilla one
-    :param statistic: Statistic used when building the pullback metric ("logp" or "entropy")
-    :param prox_h: Pullback proximal parameter ``h``
-    :param cg_lambda: Conjugate gradient regularization
-    :param cg_max_iter: Maximum number of conjugate gradient iterations
-    :param cg_tol: Conjugate gradient tolerance
-    :param fisher_ridge: Ridge term added to the covariance estimate
-    :param step_clip: Optional clipping applied to the search direction length
-    :param actor_learning_rate: Optional custom learning rate (or schedule) for the actor optimizer
-        when ``separate_optimizers`` is True.
-    :param critic_learning_rate: Optional custom learning rate (or schedule) for the critic optimizer
-        when ``separate_optimizers`` is True.
-    :param separate_optimizers: If True, use two optimizers to update actor and critic separately
-        (hyperparameters identical). Shared feature extractor (if any) is updated once using
-        the combined gradients from both losses.
-    :param log_param_norms: When True, log parameter norms (Frobenius, spectral, nuclear) and rank each update
     """
 
     policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
@@ -116,6 +66,7 @@ class A2C(OnPolicyAlgorithm):
         critic_learning_rate: Union[float, Schedule, None] = None,
         separate_optimizers: bool = False,
         log_param_norms: bool = False,
+        fr_order: int = 2,
     ):
         super().__init__(
             policy,
@@ -160,6 +111,7 @@ class A2C(OnPolicyAlgorithm):
         self.critic_learning_rate = critic_learning_rate
         self.separate_optimizers = separate_optimizers
         self.log_param_norms = log_param_norms
+        self.fr_order = fr_order
 
         # Split-optimizer related attributes
         self.actor_optimizer: Optional[th.optim.Optimizer] = None
@@ -169,8 +121,6 @@ class A2C(OnPolicyAlgorithm):
         self.actor_lr_schedule: Optional[Schedule] = None
         self.critic_lr_schedule: Optional[Schedule] = None
 
-        # Update optimizer inside the policy if we want to use RMSProp
-        # (original implementation) rather than Adam
         if use_rms_prop and "optimizer_class" not in self.policy_kwargs:
             self.policy_kwargs["optimizer_class"] = th.optim.RMSprop
             self.policy_kwargs["optimizer_kwargs"] = dict(alpha=0.99, eps=rms_prop_eps, weight_decay=0)
@@ -181,14 +131,16 @@ class A2C(OnPolicyAlgorithm):
     def _setup_model(self) -> None:
         super()._setup_model()
 
-        # When requested, build two optimizers with separated parameter groups
+        # 对 ANPG 路径，强制要求拆分 actor / critic
+        if self.use_pullback and not self.separate_optimizers:
+            raise ValueError("use_pullback=True 时请设置 separate_optimizers=True 以便拆分 actor 和 critic。")
+
         if self.separate_optimizers:
             if self.actor_learning_rate is not None:
                 self.actor_lr_schedule = FloatSchedule(self.actor_learning_rate)
             if self.critic_learning_rate is not None:
                 self.critic_lr_schedule = FloatSchedule(self.critic_learning_rate)
 
-            # Helpers to collect unique parameters
             def _extend_unique(dst: list[th.nn.Parameter], params_iter) -> None:
                 seen = {id(p) for p in dst}
                 for p in params_iter:
@@ -199,86 +151,121 @@ class A2C(OnPolicyAlgorithm):
             actor_params: list[th.nn.Parameter] = []
             critic_params: list[th.nn.Parameter] = []
 
-            # Actor-specific modules
+            # actor-specific
             _extend_unique(actor_params, self.policy.mlp_extractor.policy_net.parameters())
             _extend_unique(actor_params, self.policy.action_net.parameters())
             if hasattr(self.policy, "log_std") and isinstance(self.policy.log_std, th.nn.Parameter):
                 actor_params.append(self.policy.log_std)
 
-            # Critic-specific modules
+            # critic-specific
             _extend_unique(critic_params, self.policy.mlp_extractor.value_net.parameters())
             _extend_unique(critic_params, self.policy.value_net.parameters())
 
-            # Feature extractors: shared or separate
+            # feature extractors
             if getattr(self.policy, "share_features_extractor", True):
                 _extend_unique(actor_params, self.policy.features_extractor.parameters())
             else:
                 _extend_unique(actor_params, self.policy.pi_features_extractor.parameters())
                 _extend_unique(critic_params, self.policy.vf_features_extractor.parameters())
 
-            # Save param lists for clipping/logging
             self._actor_params = actor_params
             self._critic_params = critic_params
 
-            # Create optimizers mirroring policy optimizer hyperparameters
             actor_initial_lr = (
                 self.actor_lr_schedule(1) if self.actor_lr_schedule is not None else self.lr_schedule(1)
             )
             critic_initial_lr = (
                 self.critic_lr_schedule(1) if self.critic_lr_schedule is not None else self.lr_schedule(1)
             )
-            self.actor_optimizer = self.policy.optimizer_class(self._actor_params, lr=actor_initial_lr, **self.policy.optimizer_kwargs)  # type: ignore[arg-type]
-            self.critic_optimizer = self.policy.optimizer_class(self._critic_params, lr=critic_initial_lr, **self.policy.optimizer_kwargs)  # type: ignore[arg-type]
+            self.actor_optimizer = self.policy.optimizer_class(
+                self._actor_params, lr=actor_initial_lr, **self.policy.optimizer_kwargs
+            )  # type: ignore[arg-type]
+            self.critic_optimizer = self.policy.optimizer_class(
+                self._critic_params, lr=critic_initial_lr, **self.policy.optimizer_kwargs
+            )  # type: ignore[arg-type]
 
     def train(self) -> None:
         """
-        Update policy using the currently gathered rollout buffer (one gradient step over whole data).
+        One update over the rollout buffer.
         """
         self.policy.set_training_mode(True)
 
-        # Values recorded for logging after finishing the minibatch loop
         policy_loss = None
         value_loss = None
         entropy_loss = None
         actor_grad_norm = None
         critic_grad_norm = None
+        dnorm = None
 
         for rollout_data in self.rollout_buffer.get(batch_size=None):
             actions = rollout_data.actions
             if isinstance(self.action_space, spaces.Discrete):
                 actions = actions.long().flatten()
 
-            values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
-            values = values.flatten()
-
-            advantages = rollout_data.advantages
-            if self.normalize_advantage:
-                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-            policy_loss = -(advantages * log_prob).mean()
-            value_loss = F.mse_loss(rollout_data.returns, values)
-
-            if entropy is None:
-                entropy_loss = -th.mean(-log_prob)
-            else:
-                entropy_loss = -th.mean(entropy)
-
-            loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
-            dnorm = None
             if self.use_pullback:
-                (
-                    policy_loss,
-                    value_loss,
-                    entropy_loss,
-                    actor_grad_norm,
-                    dnorm,
-                ) = self._anpg_pb_update(
+                assert self.separate_optimizers
+                assert self._actor_params is not None and self._critic_params is not None
+                assert self.actor_optimizer is not None and self.critic_optimizer is not None
+
+                # 学习率调度
+                if self.actor_learning_rate is not None:
+                    if isinstance(self.actor_learning_rate, (float, int)):
+                        lr_actor = float(self.actor_learning_rate)
+                    else:
+                        lr_actor = self.actor_learning_rate(self._current_progress_remaining)
+                else:
+                    lr_actor = self.lr_schedule(self._current_progress_remaining)
+
+                if self.critic_learning_rate is not None:
+                    if isinstance(self.critic_learning_rate, (float, int)):
+                        lr_critic = float(self.critic_learning_rate)
+                    else:
+                        lr_critic = self.critic_learning_rate(self._current_progress_remaining)
+                else:
+                    lr_critic = self.lr_schedule(self._current_progress_remaining)
+
+                self.logger.record("train/learning_rate_actor", lr_actor)
+                self.logger.record("train/learning_rate_critic", lr_critic)
+                self.logger.record("train/learning_rate", lr_actor)
+
+                update_learning_rate(self.actor_optimizer, lr_actor)
+                update_learning_rate(self.critic_optimizer, lr_critic)
+
+                # ANPG 更新 actor
+                policy_loss, entropy_loss, actor_grad_norm, dnorm = self._anpg_pb_update(
                     rollout_data.observations,
-                    rollout_data.actions,
+                    actions,
                     rollout_data.advantages,
-                    rollout_data.returns,
                 )
+
+                # 常规更新 critic
+                values, _, _ = self.policy.evaluate_actions(rollout_data.observations, actions)
+                values = values.flatten()
+                value_loss = F.mse_loss(rollout_data.returns, values)
+                self.critic_optimizer.zero_grad()
+                (self.vf_coef * value_loss).backward()
+                critic_grad_norm = th.nn.utils.clip_grad_norm_(self._critic_params, self.max_grad_norm)
+                self.critic_optimizer.step()
+
             else:
+                # 原始 A2C 路径
+                values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
+                values = values.flatten()
+
+                advantages = rollout_data.advantages
+                if self.normalize_advantage:
+                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+                policy_loss = -(advantages * log_prob).mean()
+                value_loss = F.mse_loss(rollout_data.returns, values)
+
+                if entropy is None:
+                    entropy_loss = -th.mean(-log_prob)
+                else:
+                    entropy_loss = -th.mean(entropy)
+
+                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+
                 if self.separate_optimizers:
                     assert self.actor_optimizer is not None and self.critic_optimizer is not None
                     assert self._actor_params is not None and self._critic_params is not None
@@ -298,6 +285,7 @@ class A2C(OnPolicyAlgorithm):
                     self.logger.record("train/learning_rate_critic", critic_lr)
                     update_learning_rate(self.actor_optimizer, actor_lr)
                     update_learning_rate(self.critic_optimizer, critic_lr)
+
                     self.actor_optimizer.zero_grad()
                     self.critic_optimizer.zero_grad()
 
@@ -344,12 +332,8 @@ class A2C(OnPolicyAlgorithm):
             self._record_param_norms()
 
     def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
-        """
-        Include separate optimizers in state dicts when enabled.
-        """
         if self.separate_optimizers:
             return ["policy", "policy.optimizer", "actor_optimizer", "critic_optimizer"], []
-        # Default behavior from parent
         return super()._get_torch_save_params()
 
     def learn(
@@ -370,48 +354,72 @@ class A2C(OnPolicyAlgorithm):
             progress_bar=progress_bar,
         )
 
-    def _anpg_pb_update(self, observations, actions, advantages, returns):
+    # ===== ANPG / pullback =====
+    def _anpg_pb_update(self, observations, actions, advantages):
         if isinstance(self.action_space, spaces.Discrete):
             actions = actions.long().flatten()
 
         values, log_prob, entropy = self.policy.evaluate_actions(observations, actions)
-        values = values.flatten()
+        values = values.detach()  # actor 不用这个图
 
         adv = advantages
         if self.normalize_advantage:
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
         policy_loss = -(adv * log_prob).mean()
-        value_loss = F.mse_loss(returns, values)
         if entropy is None:
             entropy_loss = -th.mean(-log_prob)
         else:
             entropy_loss = -th.mean(entropy)
 
-        loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+        actor_loss = policy_loss + self.ent_coef * entropy_loss
 
-        self._update_learning_rate(self.policy.optimizer)
-        params = self._params()
+        # 只用 actor 参数
+        if self.separate_optimizers and self._actor_params is not None:
+            params = self._actor_params
+        else:
+            params = self._params()
 
-        g_list = th.autograd.grad(loss, params, retain_graph=False, create_graph=False)
+        g_list = th.autograd.grad(actor_loss, params, retain_graph=False, create_graph=False)
         g = self._flat([gi if gi is not None else th.zeros_like(p) for gi, p in zip(g_list, params)])
 
-        J, C_inv = self._build_J_Cinv(observations, actions)
+        # J, C^{-1} 也只对 actor 参数求导
+        J, C_inv = self._build_J_Cinv(observations, actions, params)
 
         one_over_h = 1.0 / max(self.pb_h, 1e-12)
         lam = self.pb_lambda
-
         Aop = self._Aop_from_j_cinv(J, C_inv, one_over_h, lam)
         delta = self._conjugate_gradient(Aop, -g, max_iter=self.pb_cg_max_iter, tol=self.pb_cg_tol)
+
         with th.no_grad():
+            # 先算未缩放的步长和 FR 半径
             dnorm = th.norm(delta)
-            if self.pb_step_clip is not None and dnorm > self.pb_step_clip:
-                delta = delta / (dnorm + 1e-12) * self.pb_step_clip
-            self._add_flat_(params, delta, alpha=self.actor_learning_rate)
+            Jdelta = J @ delta
+            Cinv_Jdelta = C_inv @ Jdelta
+            fr_quad = th.dot(Jdelta, Cinv_Jdelta)
+            fr_radius = 0.5 * fr_quad
+
+            if self.pb_step_clip is not None and fr_radius > 0:
+                scale = (self.pb_step_clip / (fr_radius + 1e-12)).sqrt()
+                delta = delta * scale
+
+            
+
+            # 选择 alpha
+            if self.actor_learning_rate is not None:
+                if isinstance(self.actor_learning_rate, (float, int)):
+                    alpha = float(self.actor_learning_rate)
+                else:
+                    alpha = self.actor_learning_rate(self._current_progress_remaining)
+            else:
+                alpha = self.lr_schedule(self._current_progress_remaining)
+
+            self._add_flat_(params, delta, alpha=alpha)
 
         actor_grad_norm = th.norm(g)
-        return policy_loss.detach(), value_loss.detach(), entropy_loss.detach(), actor_grad_norm, dnorm
+        return policy_loss.detach(), entropy_loss.detach(), actor_grad_norm, dnorm
 
+    # ===== flat 参数工具 =====
     def _params(self):
         return [p for p in self.policy.parameters() if p.requires_grad]
 
@@ -444,6 +452,7 @@ class A2C(OnPolicyAlgorithm):
             rs_old = rs_new
         return x
 
+    # ===== 统计量 / Fisher-Rao 特征 =====
     def _statistic_components(self, states, actions):
         if states.dim() == 1:
             states = states.unsqueeze(0)
@@ -453,7 +462,6 @@ class A2C(OnPolicyAlgorithm):
             if actions.dim() == 1:
                 actions = actions.unsqueeze(0)
 
-            # 通用：logp / entropy 分支（保留原逻辑）
             logp = dist.log_prob(actions)
             if logp.dim() == 1:
                 logp = logp.unsqueeze(-1)
@@ -473,17 +481,13 @@ class A2C(OnPolicyAlgorithm):
                 mu = dist.distribution.loc
                 std = dist.distribution.scale
                 var = std * std
-
                 s_mu = (actions - mu) / (var + 1e-12)
-
                 s_logsig = (actions - mu).pow(2) / (var + 1e-12) - 1.0
-
                 return th.cat([s_mu, s_logsig], dim=-1)
 
             raise ValueError(f"statistic '{self.statistic}' not implemented for continuous SB3 policy.")
 
         else:
-            # 离散：保留原逻辑
             if actions.dim() > 1:
                 actions = actions.squeeze(-1)
             logp = dist.log_prob(actions.long()).view(-1, 1)
@@ -493,25 +497,33 @@ class A2C(OnPolicyAlgorithm):
                 ent = dist.entropy().view(-1, 1)
                 return ent
 
-            # 新增：逐类 score（one-hot - probs），返回 [B, A]
             if self.statistic == "score_per_dim":
-                probs = dist.distribution.probs  # torch.distributions.Categorical
+                probs = dist.distribution.probs
                 num_actions = probs.shape[-1]
                 one_hot = F.one_hot(actions.long(), num_classes=num_actions).float()
-                # score: ∂/∂logits log Cat = one_hot(a) - probs
                 return one_hot - probs
 
             raise ValueError(f"statistic '{self.statistic}' not implemented for discrete SB3 policy.")
 
     def _t_mean(self, states, actions):
         t = self._statistic_components(states, actions)
-        return t.mean(dim=0)
+        feats = self._fr_features(t)
+        return feats.mean(dim=0)
+
+    def _fr_features(self, t: th.Tensor) -> th.Tensor:
+        if self.fr_order <= 1:
+            return t
+        B, K = t.shape
+        t_outer = t.unsqueeze(2) * t.unsqueeze(1)
+        t_quad = 0.5 * t_outer.reshape(B, K * K)
+        return th.cat([t, t_quad], dim=1)
 
     @th.no_grad()
     def _compute_C_t_full(self, states, actions, ridge: Optional[float] = None):
         t = self._statistic_components(states, actions)
-        batch_size, num_stats = t.shape
-        t_center = t - t.mean(dim=0, keepdim=True)
+        feats = self._fr_features(t)
+        batch_size, num_stats = feats.shape
+        t_center = feats - feats.mean(dim=0, keepdim=True)
         C = (t_center.T @ t_center) / max(batch_size, 1)
         r = float(self.pb_c_ridge if ridge is None else ridge)
         C = C + r * th.eye(num_stats, device=C.device, dtype=C.dtype)
@@ -528,8 +540,7 @@ class A2C(OnPolicyAlgorithm):
             C_inv = th.linalg.pinv(C)
         return C_inv
 
-    def _build_J(self, states, actions):
-        params = self._params()
+    def _build_J(self, states, actions, params):
         t_mean = self._t_mean(states, actions)
         K = t_mean.numel()
         D = sum(p.numel() for p in params)
@@ -547,19 +558,17 @@ class A2C(OnPolicyAlgorithm):
             J[k].copy_(row)
         return J
 
-    def _build_J_Cinv(self, states, actions):
-        J = self._build_J(states, actions)
+    def _build_J_Cinv(self, states, actions, params):
+        J = self._build_J(states, actions, params)
         C = self._compute_C_t_full(states, actions)
         C_inv = self._invert_spd(C)
         with th.no_grad():
-            # Ensure consistent dtype to avoid float/double matmul mismatch
             J = J.to(C_inv.dtype)
         return J, C_inv
 
     def _Aop_from_j_cinv(self, J, C_inv, one_over_h, lam):
         def Aop(v):
             with th.no_grad():
-                # Use implicit multiplication to avoid forming dense G = J^T C_inv J
                 Jv = J @ v
                 CJv = C_inv @ Jv
                 Gv = J.transpose(0, 1) @ CJv
