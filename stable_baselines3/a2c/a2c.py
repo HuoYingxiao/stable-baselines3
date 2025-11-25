@@ -403,7 +403,6 @@ class A2C(OnPolicyAlgorithm):
 
         Aop = self._Aop_from_j_cinv(J, C_inv, one_over_h, lam)
         delta = self._conjugate_gradient(Aop, -g, max_iter=self.pb_cg_max_iter, tol=self.pb_cg_tol)
-
         with th.no_grad():
             dnorm = th.norm(delta)
             if self.pb_step_clip is not None and dnorm > self.pb_step_clip:
@@ -470,18 +469,13 @@ class A2C(OnPolicyAlgorithm):
                     ent = ent.unsqueeze(-1)
                 return ent
 
-            # 新增：逐维 score（对均值与 log σ），返回 [B, 2A]
             if self.statistic == "score_per_dim":
-                # 取均值与方差（SB3 的 DiagGaussianDistribution）
-                # dist.distribution 是 torch.distributions.Normal，批形状 [B, A]
                 mu = dist.distribution.loc
                 std = dist.distribution.scale
                 var = std * std
 
-                # 对均值的 score: ∂/∂μ log N = (a - μ)/σ^2
                 s_mu = (actions - mu) / (var + 1e-12)
 
-                # 对 log σ 的 score: ∂/∂logσ log N = -1 + (a-μ)^2/σ^2
                 s_logsig = (actions - mu).pow(2) / (var + 1e-12) - 1.0
 
                 return th.cat([s_mu, s_logsig], dim=-1)
