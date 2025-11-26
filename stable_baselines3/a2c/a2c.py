@@ -413,22 +413,38 @@ class A2C(OnPolicyAlgorithm):
 
             Jdelta = J @ delta
             Cinv_Jdelta = C_inv @ Jdelta
-            fr_quad = th.dot(Jdelta, Cinv_Jdelta)
-            fr_radius = 0.5 * fr_quad
-
-            if self.pb_step_clip is not None and fr_radius > 0:
-                scale = (self.pb_step_clip / (fr_radius + 1e-12)).sqrt()
-                delta = delta * scale
+            fr_quad = th.dot(Jdelta, Cinv_Jdelta) 
 
             if self.actor_learning_rate is not None:
                 if isinstance(self.actor_learning_rate, (float, int)):
-                    alpha = float(self.actor_learning_rate)
+                    base_lr = float(self.actor_learning_rate)
                 else:
-                    alpha = self.actor_learning_rate(self._current_progress_remaining)
+                    base_lr = self.actor_learning_rate(self._current_progress_remaining)
             else:
-                alpha = self.lr_schedule(self._current_progress_remaining)
+                base_lr = self.lr_schedule(self._current_progress_remaining)
 
-            self._add_flat_(params, delta, alpha=alpha)
+            L_old = actor_loss.detach()
+
+            max_fr_radius = self.pb_step_clip if self.pb_step_clip is not None else None
+
+            self._last_actor_grad_flat = g.detach()
+
+            L_new, used_lr = self._pb_line_search(
+                params=params,
+                delta=delta,
+                g_flat=g.detach(),
+                observations=observations,
+                actions=actions,
+                advantages=adv,
+                base_lr=base_lr,
+                fr_quad=fr_quad.detach(),
+                L_old=L_old,
+                max_fr_radius=max_fr_radius,
+                backtrack_factor=0.5,
+                max_backtracks=10,
+                armijo_coef=0.8,
+            )
+            actor_grad_norm = th.norm(g)
 
         actor_grad_norm = th.norm(g)
         return policy_loss.detach(), entropy_loss.detach(), actor_grad_norm, dnorm
@@ -525,6 +541,18 @@ class A2C(OnPolicyAlgorithm):
     def _flat(self, tensors):
         return th.cat([t.reshape(-1) for t in tensors])
 
+    def _get_flat(self, params):
+        return th.cat([p.data.view(-1) for p in params])
+
+    @th.no_grad()
+    def _set_flat_(self, params, flat):
+        off = 0
+        for p in params:
+            n = p.numel()
+            p.data.copy_(flat[off:off + n].view_as(p))
+            off += n
+
+
     @th.no_grad()
     def _add_flat_(self, params, delta, alpha: float = 1.0):
         off = 0
@@ -551,7 +579,115 @@ class A2C(OnPolicyAlgorithm):
             rs_old = rs_new
         return x
 
-    # 统计量 / FR 特征
+    @th.no_grad()
+    def _pb_line_search(
+        self,
+        params,
+        delta: th.Tensor,
+        g_flat: th.Tensor,
+        observations,
+        actions,
+        advantages,
+        base_lr: float,
+        fr_quad: th.Tensor,
+        L_old: th.Tensor,
+        max_fr_radius: Optional[float] = None,
+        backtrack_factor: float = 0.5,
+        max_backtracks: int = 8,
+        armijo_coef: float = 0.8,
+    ):
+        """
+        在给定方向 delta 上做严格一点的 backtracking line search。
+
+        params: actor 参数列表
+        delta:  搜索方向 (flat vector, same shape as concat(params))
+        g_flat: 当前点的梯度 (flat, ∇_θ L)
+        base_lr: 初始步长
+        fr_quad: Jdelta^T C_inv Jdelta (未缩放的二次型，标量张量)
+        L_old:   旧的 actor loss（policy_loss + ent_coef * entropy_loss）
+        max_fr_radius: 最大允许的 FR 半径(如果为 None 则不做这一约束)
+        armijo_coef: Armijo 系数，越接近 1 要求越严格（0.8 比较保守）
+        """
+
+        # 先检查方向是否真的是下降方向
+        g_dot_delta = th.dot(g_flat, delta)
+        if g_dot_delta >= 0:
+            # 更新方向太怪，直接拒绝这次更新
+            theta_flat_old = self._get_flat(params)
+            self._set_flat_(params, theta_flat_old)
+            return L_old, 0.0
+
+        # 预期下降（基于一阶近似）
+        expected_improve_full = -g_dot_delta * base_lr  # 对应 base_lr 的预期下降
+        if expected_improve_full.item() <= 0:
+            theta_flat_old = self._get_flat(params)
+            self._set_flat_(params, theta_flat_old)
+            return L_old, 0.0
+
+        theta_flat_old = self._get_flat(params)
+
+        lr = base_lr
+        best_lr = 0.0
+        L_best = L_old
+        accepted = False
+
+        for _ in range(max_backtracks + 1):
+            # 几何约束：FR 半径
+            if max_fr_radius is not None:
+                fr_radius = 0.5 * (lr * lr) * fr_quad  # 标量
+                if fr_radius.item() > max_fr_radius:
+                    lr *= backtrack_factor
+                    continue
+
+            # 应用当前步长的更新
+            self._set_flat_(params, theta_flat_old)
+            self._add_flat_(params, delta, alpha=lr)
+
+            # 重新计算 actor loss
+            values, log_prob, entropy = self.policy.evaluate_actions(observations, actions)
+            values = values.detach()
+
+            adv = advantages
+            if self.normalize_advantage:
+                adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+            policy_loss_new = -(adv * log_prob).mean()
+            if entropy is None:
+                entropy_loss_new = -th.mean(-log_prob)
+            else:
+                entropy_loss_new = -th.mean(entropy)
+
+            L_new = policy_loss_new + self.ent_coef * entropy_loss_new
+
+            # 实际下降
+            actual_improve = (L_old - L_new).item()
+
+            # 对应当前 lr 的预期下降（线性缩放）
+            expected_improve_lr = (lr / base_lr) * expected_improve_full.item()
+
+            # Armijo 条件：实际下降要至少达到预期下降的 armijo_coef 倍
+            if actual_improve > 0.0 and actual_improve >= armijo_coef * expected_improve_lr:
+                accepted = True
+                L_best = L_new
+                best_lr = lr
+                break
+
+            # 否则缩小步长
+            lr *= backtrack_factor
+
+        if not accepted:
+            # 不更新，回滚参数
+            self._set_flat_(params, theta_flat_old)
+            return L_old, 0.0
+
+        # 确保参数已经在 best_lr 对应的位置
+        if best_lr != lr:
+            self._set_flat_(params, theta_flat_old)
+            self._add_flat_(params, delta, alpha=best_lr)
+
+        return L_best, best_lr
+
+
     def _statistic_components(self, states, actions):
         if states.dim() == 1:
             states = states.unsqueeze(0)
