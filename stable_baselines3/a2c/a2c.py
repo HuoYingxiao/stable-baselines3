@@ -67,6 +67,14 @@ class A2C(OnPolicyAlgorithm):
         separate_optimizers: bool = False,
         log_param_norms: bool = False,
         fr_order: int = 2,
+        # 论文风格的近端 + 内层循环
+        pb_use_inner_loop: bool = False,
+        pb_inner_steps: int = 5,
+        pb_inner_lr: float = 1.0,
+        # ===== NEW: 核化 pullback 开关和超参数 =====
+        pb_use_kernel: bool = False,
+        pb_kernel_num_anchors: int = 64,
+        pb_kernel_sigma: float = 1.0,
     ):
         super().__init__(
             policy,
@@ -113,7 +121,18 @@ class A2C(OnPolicyAlgorithm):
         self.log_param_norms = log_param_norms
         self.fr_order = fr_order
 
-        # Split-optimizer related attributes
+        # 内层循环超参数
+        self.pb_use_inner_loop = pb_use_inner_loop
+        self.pb_inner_steps = int(pb_inner_steps)
+        self.pb_inner_lr = float(pb_inner_lr)
+
+        # ===== NEW: 核化 pullback 状态 =====
+        self.pb_use_kernel = pb_use_kernel
+        self.pb_kernel_num_anchors = int(pb_kernel_num_anchors)
+        self.pb_kernel_sigma = float(pb_kernel_sigma)
+        self._kernel_anchors: Optional[th.Tensor] = None  # [M, K_base]
+
+        # split optimizers
         self.actor_optimizer: Optional[th.optim.Optimizer] = None
         self.critic_optimizer: Optional[th.optim.Optimizer] = None
         self._actor_params: Optional[list[th.nn.Parameter]] = None
@@ -131,9 +150,8 @@ class A2C(OnPolicyAlgorithm):
     def _setup_model(self) -> None:
         super()._setup_model()
 
-        # 对 ANPG 路径，强制要求拆分 actor / critic
         if self.use_pullback and not self.separate_optimizers:
-            raise ValueError("use_pullback=True 时请设置 separate_optimizers=True 以便拆分 actor 和 critic。")
+            raise ValueError("use_pullback=True 时需要 separate_optimizers=True。")
 
         if self.separate_optimizers:
             if self.actor_learning_rate is not None:
@@ -151,17 +169,14 @@ class A2C(OnPolicyAlgorithm):
             actor_params: list[th.nn.Parameter] = []
             critic_params: list[th.nn.Parameter] = []
 
-            # actor-specific
             _extend_unique(actor_params, self.policy.mlp_extractor.policy_net.parameters())
             _extend_unique(actor_params, self.policy.action_net.parameters())
             if hasattr(self.policy, "log_std") and isinstance(self.policy.log_std, th.nn.Parameter):
                 actor_params.append(self.policy.log_std)
 
-            # critic-specific
             _extend_unique(critic_params, self.policy.mlp_extractor.value_net.parameters())
             _extend_unique(critic_params, self.policy.value_net.parameters())
 
-            # feature extractors
             if getattr(self.policy, "share_features_extractor", True):
                 _extend_unique(actor_params, self.policy.features_extractor.parameters())
             else:
@@ -185,9 +200,6 @@ class A2C(OnPolicyAlgorithm):
             )  # type: ignore[arg-type]
 
     def train(self) -> None:
-        """
-        One update over the rollout buffer.
-        """
         self.policy.set_training_mode(True)
 
         policy_loss = None
@@ -207,7 +219,7 @@ class A2C(OnPolicyAlgorithm):
                 assert self._actor_params is not None and self._critic_params is not None
                 assert self.actor_optimizer is not None and self.critic_optimizer is not None
 
-                # 学习率调度
+                # lr 调度
                 if self.actor_learning_rate is not None:
                     if isinstance(self.actor_learning_rate, (float, int)):
                         lr_actor = float(self.actor_learning_rate)
@@ -231,14 +243,21 @@ class A2C(OnPolicyAlgorithm):
                 update_learning_rate(self.actor_optimizer, lr_actor)
                 update_learning_rate(self.critic_optimizer, lr_critic)
 
-                # ANPG 更新 actor
-                policy_loss, entropy_loss, actor_grad_norm, dnorm = self._anpg_pb_update(
-                    rollout_data.observations,
-                    actions,
-                    rollout_data.advantages,
-                )
+                # actor：pullback 更新
+                if self.pb_use_inner_loop:
+                    policy_loss, entropy_loss, actor_grad_norm, dnorm = self._anpg_prox_inner_update(
+                        rollout_data.observations,
+                        actions,
+                        rollout_data.advantages,
+                    )
+                else:
+                    policy_loss, entropy_loss, actor_grad_norm, dnorm = self._anpg_pb_update(
+                        rollout_data.observations,
+                        actions,
+                        rollout_data.advantages,
+                    )
 
-                # 常规更新 critic
+                # critic：普通 A2C 更新
                 values, _, _ = self.policy.evaluate_actions(rollout_data.observations, actions)
                 values = values.flatten()
                 value_loss = F.mse_loss(rollout_data.returns, values)
@@ -248,7 +267,7 @@ class A2C(OnPolicyAlgorithm):
                 self.critic_optimizer.step()
 
             else:
-                # 原始 A2C 路径
+                # 原始 A2C
                 values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
                 values = values.flatten()
 
@@ -354,13 +373,13 @@ class A2C(OnPolicyAlgorithm):
             progress_bar=progress_bar,
         )
 
-    # ===== ANPG / pullback =====
+    # ===== pullback：之前的 G=J^T C^{-1}J + CG 版本（保留） =====
     def _anpg_pb_update(self, observations, actions, advantages):
         if isinstance(self.action_space, spaces.Discrete):
             actions = actions.long().flatten()
 
         values, log_prob, entropy = self.policy.evaluate_actions(observations, actions)
-        values = values.detach()  # actor 不用这个图
+        values = values.detach()
 
         adv = advantages
         if self.normalize_advantage:
@@ -374,7 +393,6 @@ class A2C(OnPolicyAlgorithm):
 
         actor_loss = policy_loss + self.ent_coef * entropy_loss
 
-        # 只用 actor 参数
         if self.separate_optimizers and self._actor_params is not None:
             params = self._actor_params
         else:
@@ -383,7 +401,6 @@ class A2C(OnPolicyAlgorithm):
         g_list = th.autograd.grad(actor_loss, params, retain_graph=False, create_graph=False)
         g = self._flat([gi if gi is not None else th.zeros_like(p) for gi, p in zip(g_list, params)])
 
-        # J, C^{-1} 也只对 actor 参数求导
         J, C_inv = self._build_J_Cinv(observations, actions, params)
 
         one_over_h = 1.0 / max(self.pb_h, 1e-12)
@@ -392,8 +409,8 @@ class A2C(OnPolicyAlgorithm):
         delta = self._conjugate_gradient(Aop, -g, max_iter=self.pb_cg_max_iter, tol=self.pb_cg_tol)
 
         with th.no_grad():
-            # 先算未缩放的步长和 FR 半径
             dnorm = th.norm(delta)
+
             Jdelta = J @ delta
             Cinv_Jdelta = C_inv @ Jdelta
             fr_quad = th.dot(Jdelta, Cinv_Jdelta)
@@ -403,9 +420,6 @@ class A2C(OnPolicyAlgorithm):
                 scale = (self.pb_step_clip / (fr_radius + 1e-12)).sqrt()
                 delta = delta * scale
 
-            
-
-            # 选择 alpha
             if self.actor_learning_rate is not None:
                 if isinstance(self.actor_learning_rate, (float, int)):
                     alpha = float(self.actor_learning_rate)
@@ -419,7 +433,92 @@ class A2C(OnPolicyAlgorithm):
         actor_grad_norm = th.norm(g)
         return policy_loss.detach(), entropy_loss.detach(), actor_grad_norm, dnorm
 
-    # ===== flat 参数工具 =====
+    def _anpg_prox_inner_update(self, observations, actions, advantages):
+        if isinstance(self.action_space, spaces.Discrete):
+            actions = actions.long().flatten()
+
+        assert self._actor_params is not None
+        assert self.actor_optimizer is not None
+
+        adv = advantages
+        if self.normalize_advantage:
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+        with th.no_grad():
+            t_old = self._statistic_components(observations, actions)
+            feats_old = self._fr_features(t_old)
+            mu_old = feats_old.mean(dim=0)
+
+            batch_size, num_stats = feats_old.shape
+            t_center = feats_old - mu_old.unsqueeze(0)
+            C = (t_center.T @ t_center) / max(batch_size, 1)
+            r = float(self.pb_c_ridge)
+            C = C + r * th.eye(num_stats, device=C.device, dtype=C.dtype)
+            C_inv = self._invert_spd(C)
+
+        mu_old = mu_old.detach()
+        C_inv = C_inv.detach()
+
+        one_over_h = 1.0 / max(self.pb_h, 1e-12)
+
+        last_policy_loss = None
+        last_entropy_loss = None
+
+        for _ in range(self.pb_inner_steps):
+            self.actor_optimizer.zero_grad()
+
+            values, log_prob, entropy = self.policy.evaluate_actions(observations, actions)
+            values = values.detach()
+
+            policy_loss = -(adv * log_prob).mean()
+            if entropy is None:
+                entropy_loss = -th.mean(-log_prob)
+            else:
+                entropy_loss = -th.mean(entropy)
+
+            t_cur = self._statistic_components(observations, actions)
+            feats_cur = self._fr_features(t_cur)
+            mu_cur = feats_cur.mean(dim=0)
+
+            diff = mu_cur - mu_old
+            quad = diff @ (C_inv @ diff)
+
+            prox_loss = 0.5 * one_over_h * quad
+
+            total_loss = policy_loss + self.ent_coef * entropy_loss + prox_loss
+
+            total_loss.backward()
+            if self.pb_inner_lr != 1.0:
+                for p in self._actor_params:
+                    if p.grad is not None:
+                        p.grad.mul_(self.pb_inner_lr)
+
+            th.nn.utils.clip_grad_norm_(self._actor_params, self.max_grad_norm)
+            self.actor_optimizer.step()
+
+            last_policy_loss = policy_loss
+            last_entropy_loss = entropy_loss
+
+        with th.no_grad():
+            grads = []
+            for p in self._actor_params:
+                if p.grad is not None:
+                    grads.append(p.grad.view(-1))
+            if len(grads) > 0:
+                actor_grad_norm = th.norm(th.cat(grads))
+            else:
+                actor_grad_norm = th.tensor(0.0, device=observations.device)
+
+            t_cur = self._statistic_components(observations, actions)
+            feats_cur = self._fr_features(t_cur)
+            mu_cur = feats_cur.mean(dim=0)
+            diff = mu_cur - mu_old
+            fr_quad = diff @ (C_inv @ diff)
+            dnorm = th.sqrt(fr_quad + 1e-12)
+
+        assert last_policy_loss is not None and last_entropy_loss is not None
+        return last_policy_loss.detach(), last_entropy_loss.detach(), actor_grad_norm, dnorm
+
     def _params(self):
         return [p for p in self.policy.parameters() if p.requires_grad]
 
@@ -452,23 +551,31 @@ class A2C(OnPolicyAlgorithm):
             rs_old = rs_new
         return x
 
-    # ===== 统计量 / Fisher-Rao 特征 =====
+    # 统计量 / FR 特征
     def _statistic_components(self, states, actions):
         if states.dim() == 1:
             states = states.unsqueeze(0)
         dist = self.policy.get_distribution(states)
 
         if isinstance(self.action_space, spaces.Box):
+            # 连续动作：Gaussian policy
             if actions.dim() == 1:
                 actions = actions.unsqueeze(0)
+
+            if self.statistic == "action_mean":
+                mu_a = dist.distribution.loc  
+                if mu_a.dim() == 1:
+                    mu_a = mu_a.unsqueeze(0)
 
             logp = dist.log_prob(actions)
             if logp.dim() == 1:
                 logp = logp.unsqueeze(-1)
+
             if self.statistic == "logp":
                 if logp.dim() > 1:
                     logp = logp.sum(dim=-1, keepdim=True)
                 return logp
+
             if self.statistic == "entropy":
                 ent = dist.entropy()
                 if ent.dim() > 1:
@@ -488,11 +595,20 @@ class A2C(OnPolicyAlgorithm):
             raise ValueError(f"statistic '{self.statistic}' not implemented for continuous SB3 policy.")
 
         else:
+            # 离散动作：Categorical policy
             if actions.dim() > 1:
                 actions = actions.squeeze(-1)
+
+            if self.statistic == "action_mean":
+                probs = dist.distribution.probs  # shape [B, num_actions]
+                return probs
+
+            # ===== 原有分支 =====
             logp = dist.log_prob(actions.long()).view(-1, 1)
+
             if self.statistic == "logp":
                 return logp
+
             if self.statistic == "entropy":
                 ent = dist.entropy().view(-1, 1)
                 return ent
@@ -511,6 +627,40 @@ class A2C(OnPolicyAlgorithm):
         return feats.mean(dim=0)
 
     def _fr_features(self, t: th.Tensor) -> th.Tensor:
+        """
+        t: [B, K_base]
+        返回 pullback 用的特征 φ(s,a)。
+        当 pb_use_kernel=True 时使用核特征；否则使用原来的 FR 多项式特征。
+        """
+        # ===== NEW: 核化分支 =====
+        if self.pb_use_kernel:
+            # 懒初始化 kernel anchors：用当前 batch 的 t 选一部分
+            if self._kernel_anchors is None:
+                with th.no_grad():
+                    B, K_base = t.shape
+                    M = min(self.pb_kernel_num_anchors, B)
+                    idx = th.randperm(B, device=t.device)[:M]
+                    self._kernel_anchors = t[idx].detach().clone()  # [M, K_base]
+
+            anchors = self._kernel_anchors  # [M, K_base]
+            B, K_base = t.shape
+            M = anchors.shape[0]
+
+            # RBF 核：k(t, z_m) = exp(- ||t - z_m||^2 / (2σ^2))
+            diff = t.unsqueeze(1) - anchors.unsqueeze(0)  # [B, M, K_base]
+            sq_dist = (diff * diff).sum(dim=-1)          # [B, M]
+            sigma2 = self.pb_kernel_sigma * self.pb_kernel_sigma + 1e-12
+            phi = th.exp(-0.5 * sq_dist / sigma2)        # [B, M]
+
+            if self.fr_order <= 1:
+                return phi
+
+            # 可选：在核特征上再加 FR 二阶项（注意维度会是 M + M^2）
+            phi_outer = phi.unsqueeze(2) * phi.unsqueeze(1)  # [B, M, M]
+            phi_quad = 0.5 * phi_outer.reshape(B, M * M)
+            return th.cat([phi, phi_quad], dim=1)
+
+        # ===== 原始 FR 多项式特征 =====
         if self.fr_order <= 1:
             return t
         B, K = t.shape
