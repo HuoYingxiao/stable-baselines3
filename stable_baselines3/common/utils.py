@@ -82,13 +82,17 @@ def update_learning_rate(optimizer: th.optim.Optimizer, learning_rate: float) ->
 class FloatSchedule:
     """
     Wrapper that ensures the output of a Schedule is cast to float.
-    Can wrap either a constant value or an existing callable Schedule.
+    Can wrap either a constant value, an existing callable Schedule, or a string
+    shorthand (e.g. ``\"lin_1e-3\"`` for a linear decay to zero).
 
-    :param value_schedule: Constant value or callable schedule
-            (e.g. LinearSchedule, ConstantSchedule)
+    :param value_schedule: Constant value, callable schedule or shorthand string
+            (e.g. LinearSchedule, ConstantSchedule, ``\"lin_1e-3\"``)
     """
 
-    def __init__(self, value_schedule: Union[Schedule, float]):
+    def __init__(self, value_schedule: Union[Schedule, float, str]):
+        if isinstance(value_schedule, str):
+            value_schedule = self._parse_string_schedule(value_schedule)
+
         if isinstance(value_schedule, FloatSchedule):
             self.value_schedule: Schedule = value_schedule.value_schedule
         elif isinstance(value_schedule, (float, int)):
@@ -96,6 +100,29 @@ class FloatSchedule:
         else:
             assert callable(value_schedule), f"The learning rate schedule must be a float or a callable, not {value_schedule}"
             self.value_schedule = value_schedule
+
+    @staticmethod
+    def _parse_string_schedule(value_schedule: str) -> Schedule:
+        """
+        Parse a string shorthand into a schedule. Supports:
+          - ``\"lin_<value>\"``: linear decay from <value> to 0 over training
+          - plain numeric strings: treated as constant schedules
+        """
+        if value_schedule.startswith("lin_"):
+            try:
+                initial_value = float(value_schedule.split("_", 1)[1])
+            except ValueError as err:
+                raise ValueError(f"Invalid linear schedule specification: {value_schedule}") from err
+            return LinearSchedule(start=initial_value, end=0.0, end_fraction=1.0)
+
+        try:
+            const_value = float(value_schedule)
+        except ValueError as err:
+            raise ValueError(
+                f"Unsupported schedule string {value_schedule!r}. "
+                "Use 'lin_<value>' for a linear schedule or provide a numeric value."
+            ) from err
+        return ConstantSchedule(const_value)
 
     def __call__(self, progress_remaining: float) -> float:
         # Cast to float to avoid unpickling errors to enable weights_only=True, see GH#1900

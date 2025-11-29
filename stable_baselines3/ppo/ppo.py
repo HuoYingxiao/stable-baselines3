@@ -115,8 +115,8 @@ class PPO(OnPolicyAlgorithm):
         advantage_multiplier: float = 1.0,
         normalize_advantage_mean: bool = True,
         separate_optimizers: bool = False,
-        actor_learning_rate: Union[float, Schedule, None] = None,
-        critic_learning_rate: Union[float, Schedule, None] = None,
+        actor_learning_rate: Union[float, Schedule, str, None] = None,
+        critic_learning_rate: Union[float, Schedule, str, None] = None,
         log_param_norms: bool = False,
         _init_setup_model: bool = True,
     ):
