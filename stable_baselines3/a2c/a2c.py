@@ -80,7 +80,7 @@ class A2C(OnPolicyAlgorithm):
         pb_kernel_auto_sigma: bool = True,
         pb_use_momentum: bool = False,
         pb_momentum_beta: float = 0.9,
-        pb_use_midpoint_predict: bool = False,
+        pb_use_nesterov_predict: bool = False,
         pb_predict_iters: int = 1,
     ):
         super().__init__(
@@ -146,7 +146,7 @@ class A2C(OnPolicyAlgorithm):
         # momentum
         self.pb_use_momentum = pb_use_momentum
         self.pb_momentum_beta = float(pb_momentum_beta)
-        self.pb_use_midpoint_predict = pb_use_midpoint_predict
+        self.pb_use_midpoint_predict = pb_use_nesterov_predict
         self.pb_predict_iters = int(pb_predict_iters)
 
 
@@ -390,9 +390,6 @@ class A2C(OnPolicyAlgorithm):
             progress_bar=progress_bar,
         )
 
-    # ===== pullback：之前的 G=J^T C^{-1}J + CG 版本（保留） =====
-        # ===== pullback：G = J^T C^{-1} J + CG，支持 predictor-based 中点近似 =====
-        # ===== pullback：G = J^T C^{-1} J + CG，带 predictor-corrector 中点近似 =====
     def _anpg_pb_update(self, observations, actions, advantages):
         if isinstance(self.action_space, spaces.Discrete):
             actions = actions.long().flatten()
@@ -413,121 +410,83 @@ class A2C(OnPolicyAlgorithm):
 
         actor_loss = policy_loss + self.ent_coef * entropy_loss
 
+        # 选择要更新的参数列表（actor 参数）
         if self.separate_optimizers and self._actor_params is not None:
             params = self._actor_params
         else:
             params = self._params()
 
-        # 当前点的梯度 g_k
+        # 当前点 θ_k 的梯度 g_k
         g_list = th.autograd.grad(actor_loss, params, retain_graph=False, create_graph=False)
         g_base = self._flat([gi if gi is not None else th.zeros_like(p) for gi, p in zip(g_list, params)])
 
         one_over_h = 1.0 / max(self.pb_h, 1e-12)
         lam = self.pb_lambda
 
-        # 2. predictor-corrector：允许多次预测-修正，但整个过程中都不真正更新参数
+        # 当前参数向量 θ_k
+        theta_flat_base = self._get_flat(params)
+
+        # 2. Nesterov 外推点版本
+        #    用 θ_nest = θ_k + β * Δθ_{k-1} 做 BE 中的“近似 θ_{k+1}”，
+        #    然后在 θ_nest 上计算几何矩阵和梯度，用来构造隐式步。
         if self.pb_use_midpoint_predict:
-            theta_flat_base = self._get_flat(params)
-            g_curr = g_base.detach()
+            # 构造外推点 θ_nest
+            use_last_step = (
+                self._pb_last_step_flat is not None
+                and self._pb_last_step_flat.shape == theta_flat_base.shape
+            )
+            if use_last_step:
+                beta_nest = self.pb_momentum_beta
+                theta_flat_nest = theta_flat_base + beta_nest * self._pb_last_step_flat
+            else:
+                # 第一次或上一次未更新成功时，没有历史步长，退化为当前点
+                theta_flat_nest = theta_flat_base
 
-            num_iters = getattr(self, "pb_predict_iters", 1)
-            if num_iters < 1:
-                num_iters = 1
+            # 把参数临时设到 θ_nest
+            self._set_flat_(params, theta_flat_nest)
 
-            # 可以在 __init__ 中加一个参数 pb_pred_fr_radius，也可以先写死一个值
-            pred_radius = getattr(self, "pb_pred_fr_radius", None)
-            # 例如在 __init__ 里：pb_pred_fr_radius: Optional[float] = None
-            # 然后 self.pb_pred_fr_radius = pb_pred_fr_radius
+            # 在 θ_nest 上重算 loss 和梯度（近似 BE 中的 ∇f(θ_{k+1}))
+            values_p, log_prob_p, entropy_p = self.policy.evaluate_actions(observations, actions)
+            values_p = values_p.detach()
 
-            J_final: Optional[th.Tensor] = None
-            C_inv_final: Optional[th.Tensor] = None
-            g_final: Optional[th.Tensor] = None
+            adv_p = advantages
+            if self.normalize_advantage:
+                adv_p = (adv_p - adv_p.mean()) / (adv_p.std() + 1e-8)
 
-            for it in range(num_iters):
-                # 2.1 在当前 θ_k 上构造几何矩阵 G(θ_k)
-                self._set_flat_(params, theta_flat_base)
-                J_tmp, C_inv_tmp = self._build_J_Cinv(observations, actions, params)
-                Aop_tmp = self._Aop_from_j_cinv(J_tmp, C_inv_tmp, one_over_h, lam)
+            policy_loss_p = -(adv_p * log_prob_p).mean()
+            if entropy_p is None:
+                entropy_loss_p = -th.mean(-log_prob_p)
+            else:
+                entropy_loss_p = -th.mean(entropy_p)
 
-                # 2.2 解线性系统，得到无约束预测方向
-                delta_pred = self._conjugate_gradient(
-                    Aop_tmp,
-                    -g_curr,
-                    max_iter=self.pb_cg_max_iter,
-                    tol=self.pb_cg_tol,
-                )
+            actor_loss_p = policy_loss_p + self.ent_coef * entropy_loss_p
 
-                # 2.3 用 FR 二次型做 trust region 缩放（TRPO 风格）
-                if pred_radius is not None:
-                    Jdelta = J_tmp @ delta_pred
-                    Cinv_Jdelta = C_inv_tmp @ Jdelta
-                    fr_quad_pred = th.dot(Jdelta, Cinv_Jdelta)  # = delta_pred^T G delta_pred
+            grad_list_p = th.autograd.grad(actor_loss_p, params, retain_graph=False, create_graph=False)
+            g_nest = self._flat(
+                [gi if gi is not None else th.zeros_like(p) for gi, p in zip(grad_list_p, params)]
+            ).detach()
 
-                    if fr_quad_pred.item() > 0.0:
-                        # s = sqrt( pred_radius / fr_quad_pred )
-                        scale = th.sqrt(
-                            self.pb_step_clip
-                            / (fr_quad_pred + 1e-12)
-                        )
-                        # 不放大，只缩小：避免 scale>1 导致预测步更大
-                        scale = th.clamp(scale, max=1.0)
-                        delta_pred = delta_pred * scale
-
-                # 2.4 预测点：这里可以直接 alpha_pred = 1.0，
-                # 因为 FR 缩放已经控制了“半径大小”
-                base_lr = (
-                    self.actor_lr_schedule(self._current_progress_remaining)  # type: ignore[operator]
-                    if self.actor_lr_schedule is not None
-                    else self.lr_schedule(self._current_progress_remaining)
-                )
-
-                theta_flat_pred = theta_flat_base + base_lr * delta_pred
-
-                # 2.5 在 θ_pred 上重算 loss 和梯度
-                self._set_flat_(params, theta_flat_pred)
-
-                values_p, log_prob_p, entropy_p = self.policy.evaluate_actions(observations, actions)
-                values_p = values_p.detach()
-
-                adv_p = advantages
-                if self.normalize_advantage:
-                    adv_p = (adv_p - adv_p.mean()) / (adv_p.std() + 1e-8)
-
-                policy_loss_p = -(adv_p * log_prob_p).mean()
-                if entropy_p is None:
-                    entropy_loss_p = -th.mean(-log_prob_p)
-                else:
-                    entropy_loss_p = -th.mean(entropy_p)
-
-                actor_loss_p = policy_loss_p + self.ent_coef * entropy_loss_p
-
-                grad_list_p = th.autograd.grad(actor_loss_p, params, retain_graph=False, create_graph=False)
-                g_curr = self._flat(
-                    [gi if gi is not None else th.zeros_like(p) for gi, p in zip(grad_list_p, params)]
-                )
-
-                if it == num_iters - 1:
-                    J_final = J_tmp
-                    C_inv_final = C_inv_tmp
-                    g_final = g_curr.detach()
+            # 在 θ_nest 上构造 G(θ_nest) = J^T C^{-1} J
+            J_nest, C_inv_nest = self._build_J_Cinv(observations, actions, params)
 
             # 回滚到真实参数 θ_k，真正的更新仍然是从 θ_k 出发
             self._set_flat_(params, theta_flat_base)
 
-            # 用最后的预测梯度 g_final 和预测点几何 G(θ_pred) 解 BE 线性系统
-            assert J_final is not None and C_inv_final is not None and g_final is not None
-            J = J_final
-            C_inv = C_inv_final
-            Aop = self._Aop_from_j_cinv(J, C_inv, one_over_h, lam)
+            # 在 θ_nest 所对应的几何上求解隐式步：
+            # (1/h) G(θ_nest) Δθ + λ Δθ = - ∇f(θ_nest)
+            Aop = self._Aop_from_j_cinv(J_nest, C_inv_nest, one_over_h, lam)
             delta = self._conjugate_gradient(
                 Aop,
-                -g_final,
+                -g_nest,
                 max_iter=self.pb_cg_max_iter,
                 tol=self.pb_cg_tol,
             )
 
+            J = J_nest
+            C_inv = C_inv_nest
+
         else:
-            # 不用预测器：回到原来的版本，直接在当前 θ_k 上算 G(θ_k) 并解一次 BE 系统
+            # 不用预测器：直接在当前 θ_k 上算 G(θ_k) 并解一次 BE 系统
             J, C_inv = self._build_J_Cinv(observations, actions, params)
             Aop = self._Aop_from_j_cinv(J, C_inv, one_over_h, lam)
             delta = self._conjugate_gradient(
@@ -537,7 +496,7 @@ class A2C(OnPolicyAlgorithm):
                 tol=self.pb_cg_tol,
             )
 
-        # 3. 方向后处理（momentum）+ line search + 记录步长
+        # 3. 方向后处理（动量 / Nesterov 外的惯性）+ line search + 记录步长
         with th.no_grad():
             search_delta = delta
             if self.pb_use_momentum:
@@ -546,14 +505,13 @@ class A2C(OnPolicyAlgorithm):
                     and self._pb_last_direction_flat.shape == delta.shape
                 ):
                     beta = self.pb_momentum_beta
+                    # 这里是“方向动量”，和上面的 Nesterov 外推是两个概念
                     search_delta = beta * self._pb_last_direction_flat + (1.0 - beta) * delta
                 self._pb_last_direction_flat = search_delta.detach().clone()
 
             dnorm = th.norm(search_delta)
 
-            # 注意这里的 J 和 C_inv 来自上面的分支：
-            # - predictor 模式下：J, C_inv 是在最后预测点 θ_pred 上算的几何
-            # - 普通模式下：J, C_inv 是在 θ_k 上算的几何
+            # FR 二次型：Δθ^T G Δθ
             Jdelta = J @ search_delta
             Cinv_Jdelta = C_inv @ Jdelta
             fr_quad = th.dot(Jdelta, Cinv_Jdelta)
@@ -569,7 +527,7 @@ class A2C(OnPolicyAlgorithm):
             max_fr_radius = self.pb_step_clip if self.pb_step_clip is not None else None
             self._last_actor_grad_flat = g_base.detach()
 
-            # line search 中的下降性检查仍然用当前点的梯度 g_base
+            # line search 的下降性检查仍然用当前点的梯度 g_base
             L_new, used_lr = self._pb_line_search(
                 params=params,
                 delta=search_delta,
@@ -588,7 +546,6 @@ class A2C(OnPolicyAlgorithm):
             actor_grad_norm = th.norm(g_base)
 
         return policy_loss.detach(), entropy_loss.detach(), actor_grad_norm, dnorm
-
 
 
     def _anpg_prox_inner_update(self, observations, actions, advantages):
