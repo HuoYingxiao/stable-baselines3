@@ -37,6 +37,7 @@ class A2C(OnPolicyAlgorithm):
         n_steps: int = 5,
         gamma: float = 0.99,
         gae_lambda: float = 1.0,
+        n_critic_updates: int = 1,
         ent_coef: float = 0.0,
         vf_coef: float = 0.5,
         max_grad_norm: float = 0.5,
@@ -116,6 +117,7 @@ class A2C(OnPolicyAlgorithm):
         )
 
         self.normalize_advantage = normalize_advantage
+        self.n_critic_updates = int(n_critic_updates)
 
         # pullback / ANPG 超参数
         self.use_pullback = use_pullback
@@ -327,6 +329,24 @@ class A2C(OnPolicyAlgorithm):
 
                     self.policy.optimizer.step()
 
+                    # 额外的 critic-only 更新
+                    extra_critic_updates = max(self.n_critic_updates - 1, 0)
+                    for _ in range(extra_critic_updates):
+                        values, _, _ = self.policy.evaluate_actions(rollout_data.observations, actions)
+                        values = values.flatten()
+                        value_loss = F.mse_loss(rollout_data.returns, values)
+
+                        self.policy.optimizer.zero_grad()
+                        (self.vf_coef * value_loss).backward()
+                        if self._critic_params is not None:
+                            self._clear_grads_except(self._critic_params)
+                            critic_grad_norm = th.nn.utils.clip_grad_norm_(self._critic_params, self.max_grad_norm)
+                        else:
+                            critic_grad_norm = th.nn.utils.clip_grad_norm_(
+                                self.policy.parameters(), self.max_grad_norm
+                            )
+                        self.policy.optimizer.step()
+
                     # 日志用 shared 的值
                     policy_loss = policy_loss_shared.detach()
                     entropy_loss = entropy_loss_shared.detach()
@@ -374,14 +394,16 @@ class A2C(OnPolicyAlgorithm):
                         )
 
                     # ---- critic: 只看 value loss ----
-                    values, _, _ = self.policy.evaluate_actions(rollout_data.observations, actions)
-                    values = values.flatten()
-                    value_loss = F.mse_loss(rollout_data.returns, values)
+                    value_loss = None
+                    for _ in range(self.n_critic_updates):
+                        values, _, _ = self.policy.evaluate_actions(rollout_data.observations, actions)
+                        values = values.flatten()
+                        value_loss = F.mse_loss(rollout_data.returns, values)
 
-                    self.critic_optimizer.zero_grad()
-                    (self.vf_coef * value_loss).backward()
-                    critic_grad_norm = th.nn.utils.clip_grad_norm_(critic_params, self.max_grad_norm)
-                    self.critic_optimizer.step()
+                        self.critic_optimizer.zero_grad()
+                        (self.vf_coef * value_loss).backward()
+                        critic_grad_norm = th.nn.utils.clip_grad_norm_(critic_params, self.max_grad_norm)
+                        self.critic_optimizer.step()
 
             else:
                 # ===== 原始 A2C =====
@@ -423,18 +445,23 @@ class A2C(OnPolicyAlgorithm):
                     update_learning_rate(self.critic_optimizer, critic_lr)
 
                     self.actor_optimizer.zero_grad()
-                    self.critic_optimizer.zero_grad()
 
                     actor_loss = policy_loss + self.ent_coef * entropy_loss
-                    actor_loss.backward(retain_graph=True)
-                    critic_loss = self.vf_coef * value_loss
-                    critic_loss.backward()
+                    actor_loss.backward()
 
                     actor_grad_norm = th.nn.utils.clip_grad_norm_(self._actor_params, self.max_grad_norm)
                     self.actor_optimizer.step()
 
-                    critic_grad_norm = th.nn.utils.clip_grad_norm_(self._critic_params, self.max_grad_norm)
-                    self.critic_optimizer.step()
+                    value_loss = None
+                    for _ in range(self.n_critic_updates):
+                        values, _, _ = self.policy.evaluate_actions(rollout_data.observations, actions)
+                        values = values.flatten()
+                        value_loss = F.mse_loss(rollout_data.returns, values)
+
+                        self.critic_optimizer.zero_grad()
+                        (self.vf_coef * value_loss).backward()
+                        critic_grad_norm = th.nn.utils.clip_grad_norm_(self._critic_params, self.max_grad_norm)
+                        self.critic_optimizer.step()
                 else:
                     self._update_learning_rate(self.policy.optimizer)
                     self.policy.optimizer.zero_grad()
@@ -444,6 +471,25 @@ class A2C(OnPolicyAlgorithm):
                     actor_grad_norm = th.norm(
                         th.cat([p.grad.view(-1) for p in self.policy.parameters() if p.grad is not None])
                     )
+
+                    # 额外的 critic-only 更新
+                    extra_critic_updates = max(self.n_critic_updates - 1, 0)
+                    if extra_critic_updates > 0:
+                        for _ in range(extra_critic_updates):
+                            values, _, _ = self.policy.evaluate_actions(rollout_data.observations, actions)
+                            values = values.flatten()
+                            value_loss = F.mse_loss(rollout_data.returns, values)
+
+                            self.policy.optimizer.zero_grad()
+                            (self.vf_coef * value_loss).backward()
+                            if self._critic_params is not None:
+                                self._clear_grads_except(self._critic_params)
+                                critic_grad_norm = th.nn.utils.clip_grad_norm_(self._critic_params, self.max_grad_norm)
+                            else:
+                                critic_grad_norm = th.nn.utils.clip_grad_norm_(
+                                    self.policy.parameters(), self.max_grad_norm
+                                )
+                            self.policy.optimizer.step()
 
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
