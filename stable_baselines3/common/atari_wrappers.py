@@ -307,7 +307,12 @@ class AtariWrapper(gym.Wrapper[np.ndarray, int, np.ndarray, int]):
             env = EpisodicLifeEnv(env)
         if "FIRE" in env.unwrapped.get_action_meanings():  # type: ignore[attr-defined]
             env = FireResetEnv(env)
-        env = WarpFrame(env, width=screen_size, height=screen_size)
+        obs_space = env.observation_space
+        is_ram = isinstance(obs_space, spaces.Box) and len(obs_space.shape) == 1
+
+        if not is_ram:
+            env = WarpFrame(env, width=screen_size, height=screen_size)
+        # env = WarpFrame(env, width=screen_size, height=screen_size)
         if clip_reward:
             env = ClipRewardEnv(env)
 
