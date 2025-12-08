@@ -199,10 +199,15 @@ class A2C(OnPolicyAlgorithm):
 
         # feature extractors
         if getattr(self.policy, "share_features_extractor", True):
-            _extend_unique(critic_params, self.policy.features_extractor.parameters())
+            if self.separate_optimizers:
+                _extend_unique(actor_params, self.policy.features_extractor.parameters())
+                _extend_unique(critic_params, self.policy.features_extractor.parameters())
+            else:
+                _extend_unique(critic_params, self.policy.features_extractor.parameters())
         else:
             _extend_unique(actor_params, self.policy.pi_features_extractor.parameters())
             _extend_unique(critic_params, self.policy.vf_features_extractor.parameters())
+
 
         self._actor_params = actor_params
         self._critic_params = critic_params
@@ -957,6 +962,12 @@ class A2C(OnPolicyAlgorithm):
                 else:
                     ent = ent.unsqueeze(-1)
                 return ent
+            
+            if self.statistic == "mu_logsig":
+                mu = dist.distribution.loc          # [B, d]
+                std = dist.distribution.scale
+                logsig = th.log(std + 1e-12)        # [B, d]
+                return th.cat([mu, logsig], dim=-1) 
 
             if self.statistic == "score_per_dim":
                 mu = dist.distribution.loc
@@ -977,6 +988,14 @@ class A2C(OnPolicyAlgorithm):
                 return probs
 
             logp = dist.log_prob(actions.long()).view(-1, 1)
+
+            if self.statistic == "probs":
+                probs = dist.distribution.probs      # [B, K]
+                return probs
+
+            if self.statistic == "logits":
+                logits = dist.distribution.logits    # [B, K]
+                return logits
 
             if self.statistic == "logp":
                 return logp
