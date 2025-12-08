@@ -55,7 +55,7 @@ class A2C(OnPolicyAlgorithm):
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
-        # pullback / ANPG 相关
+        # pullback
         use_pullback: bool = False,
         statistic: str = "logp",
         prox_h: float = 10.0,
@@ -69,11 +69,11 @@ class A2C(OnPolicyAlgorithm):
         separate_optimizers: bool = False,
         log_param_norms: bool = False,
         fr_order: int = 2,
-        # inner loop 近端版本
+        # inner loop
         pb_use_inner_loop: bool = False,
         pb_inner_steps: int = 5,
         pb_inner_lr: float = 1.0,
-        # kernel 化
+        # kernel
         pb_use_kernel: bool = False,
         pb_kernel_num_anchors: int = 64,
         pb_kernel_sigma: float = 1.0,
@@ -119,7 +119,7 @@ class A2C(OnPolicyAlgorithm):
         self.normalize_advantage = normalize_advantage
         self.n_critic_updates = int(n_critic_updates)
 
-        # pullback / ANPG 超参数
+        # pullback / ANPG 
         self.use_pullback = use_pullback
         self.statistic = statistic
         self.pb_h = float(prox_h)
@@ -149,7 +149,7 @@ class A2C(OnPolicyAlgorithm):
         self.pb_kernel_auto_sigma = bool(pb_kernel_auto_sigma)
         self._kernel_anchors: Optional[th.Tensor] = None  # [M, K_base]
 
-        # momentum / Nesterov 预测
+        # momentum / Nesterov
         self.pb_use_momentum = pb_use_momentum
         self.pb_momentum_beta = float(pb_momentum_beta)
         self.pb_use_midpoint_predict = pb_use_nesterov_predict
@@ -199,10 +199,8 @@ class A2C(OnPolicyAlgorithm):
 
         # feature extractors
         if getattr(self.policy, "share_features_extractor", True):
-            # 极端 A：共享特征提取器放到 critic 侧
             _extend_unique(critic_params, self.policy.features_extractor.parameters())
         else:
-            # 不共享特征抽取器时：actor/critic 各用一套
             _extend_unique(actor_params, self.policy.pi_features_extractor.parameters())
             _extend_unique(critic_params, self.policy.vf_features_extractor.parameters())
 
@@ -210,7 +208,6 @@ class A2C(OnPolicyAlgorithm):
         self._critic_params = critic_params
 
         if self.separate_optimizers:
-            # 完全分开的 AC：actor / critic 各自一个优化器
             if self.actor_learning_rate is not None:
                 self.actor_lr_schedule = FloatSchedule(self.actor_learning_rate)
             if self.critic_learning_rate is not None:
@@ -229,13 +226,11 @@ class A2C(OnPolicyAlgorithm):
                 self._critic_params, lr=critic_initial_lr, **self.policy.optimizer_kwargs
             )  # type: ignore[arg-type]
         else:
-            # 单优化器模式：保留 SB3 的 policy.optimizer
             if self.actor_learning_rate is not None:
                 self.actor_lr_schedule = FloatSchedule(self.actor_learning_rate)
             actor_initial_lr = (
                 self.actor_lr_schedule(1) if self.actor_lr_schedule is not None else self.lr_schedule(1)
             )
-            # inner-loop prox 需要一个 optimizer 引用，这里直接用 policy.optimizer
             if self.use_pullback and self.pb_use_inner_loop:
                 self.actor_optimizer = self.policy.optimizer
 
@@ -258,16 +253,11 @@ class A2C(OnPolicyAlgorithm):
                 actor_params = self._actor_params if self._actor_params is not None else self._params()
                 critic_params = self._critic_params if self._critic_params is not None else self._params()
 
-                # ======================
-                # separate_optimizers = False:
-                # 极端 A：单优化器，actor 先 pullback，feature+critic 再 joint 更新一次
-                # ======================
                 if not self.separate_optimizers:
                     lr = self.lr_schedule(self._current_progress_remaining)
                     self.logger.record("train/learning_rate", lr)
                     self._update_learning_rate(self.policy.optimizer)
 
-                    # ---- actor: pullback 更新（head）----
                     if self.pb_use_inner_loop:
                         policy_loss, entropy_loss, actor_grad_norm, dnorm = self._anpg_prox_inner_update(
                             rollout_data.observations,
@@ -288,10 +278,9 @@ class A2C(OnPolicyAlgorithm):
                             rollout_data.advantages,
                             returns=None,
                             apply_update=True,
-                            include_value_loss=False,  # 这里只更新 actor_params
+                            include_value_loss=False,  
                         )
 
-                    # ---- critic + shared feature: 用 joint loss 更新一次 ----
                     values, log_prob, entropy = self.policy.evaluate_actions(
                         rollout_data.observations, actions
                     )
@@ -319,7 +308,6 @@ class A2C(OnPolicyAlgorithm):
                     total_shared_loss.backward()
 
                     if self._critic_params is not None:
-                        # 只更新 critic_params（含 feature extractor），actor head 的 grad 清掉
                         self._clear_grads_except(self._critic_params)
                         critic_grad_norm = th.nn.utils.clip_grad_norm_(self._critic_params, self.max_grad_norm)
                     else:
@@ -329,7 +317,6 @@ class A2C(OnPolicyAlgorithm):
 
                     self.policy.optimizer.step()
 
-                    # 额外的 critic-only 更新
                     extra_critic_updates = max(self.n_critic_updates - 1, 0)
                     for _ in range(extra_critic_updates):
                         values, _, _ = self.policy.evaluate_actions(rollout_data.observations, actions)
@@ -347,14 +334,8 @@ class A2C(OnPolicyAlgorithm):
                             )
                         self.policy.optimizer.step()
 
-                    # 日志用 shared 的值
                     policy_loss = policy_loss_shared.detach()
                     entropy_loss = entropy_loss_shared.detach()
-
-                # ======================
-                # separate_optimizers = True:
-                # 完全分开的 AC：actor 优化器只看 actor loss，critic 优化器只看 value loss
-                # ======================
                 else:
                     assert self.actor_optimizer is not None and self.critic_optimizer is not None
 
@@ -376,7 +357,6 @@ class A2C(OnPolicyAlgorithm):
                     update_learning_rate(self.actor_optimizer, lr_actor)
                     update_learning_rate(self.critic_optimizer, lr_critic)
 
-                    # ---- actor: pullback 更新，只更新 actor_params ----
                     if self.pb_use_inner_loop:
                         policy_loss, entropy_loss, actor_grad_norm, dnorm = self._anpg_prox_inner_update(
                             rollout_data.observations,
@@ -393,7 +373,6 @@ class A2C(OnPolicyAlgorithm):
                             include_value_loss=False,
                         )
 
-                    # ---- critic: 只看 value loss ----
                     value_loss = None
                     for _ in range(self.n_critic_updates):
                         values, _, _ = self.policy.evaluate_actions(rollout_data.observations, actions)
@@ -406,7 +385,6 @@ class A2C(OnPolicyAlgorithm):
                         self.critic_optimizer.step()
 
             else:
-                # ===== 原始 A2C =====
                 values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
                 values = values.flatten()
 
@@ -472,7 +450,6 @@ class A2C(OnPolicyAlgorithm):
                         th.cat([p.grad.view(-1) for p in self.policy.parameters() if p.grad is not None])
                     )
 
-                    # 额外的 critic-only 更新
                     extra_critic_updates = max(self.n_critic_updates - 1, 0)
                     if extra_critic_updates > 0:
                         for _ in range(extra_critic_updates):
@@ -536,7 +513,6 @@ class A2C(OnPolicyAlgorithm):
             progress_bar=progress_bar,
         )
 
-    # ===== pullback / BE + Nesterov 版本 =====
     def _anpg_pb_update(
         self,
         observations,
@@ -702,7 +678,6 @@ class A2C(OnPolicyAlgorithm):
 
         return policy_loss.detach(), entropy_loss.detach(), actor_grad_norm, dnorm, step_flat.detach(), used_lr
 
-    # ===== inner loop 近端版本 =====
     def _anpg_prox_inner_update(self, observations, actions, advantages):
         if isinstance(self.action_space, spaces.Discrete):
             actions = actions.long().flatten()
@@ -792,7 +767,6 @@ class A2C(OnPolicyAlgorithm):
         assert last_policy_loss is not None and last_entropy_loss is not None
         return last_policy_loss.detach(), last_entropy_loss.detach(), actor_grad_norm, dnorm
 
-    # ===== 工具函数 =====
     def _params(self):
         return [p for p in self.policy.parameters() if p.requires_grad]
 
@@ -951,8 +925,7 @@ class A2C(OnPolicyAlgorithm):
         self._pb_last_step_flat = step_flat
 
         return L_best, best_lr, step_flat
-
-    # ===== 统计量 / FR / 核特征 =====
+        
     def _statistic_components(self, states, actions):
         if states.dim() == 1:
             states = states.unsqueeze(0)
